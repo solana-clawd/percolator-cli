@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import { getGlobalFlags } from "../cli.js";
 import { loadConfig } from "../config.js";
 import { createContext } from "../runtime/context.js";
@@ -10,14 +10,29 @@ import { validatePublicKey } from "../validation.js";
 const PASSIVE_MATCHER_EDGE_BPS = 50n;
 const BPS_DENOM = 10000n;
 
+// vAMM context magic number
+const VAMM_MAGIC = BigInt("0x5045524334d41544");
+const VAMM_MAGIC_ALT = BigInt("0x4354414d43524550"); // "PERCMATC" LE
+
 interface LpQuote {
   lpIndex: number;
   matcherProgram: string;
+  matcherContext: string;
   bid: bigint;
   ask: bigint;
   edgeBps: number;
+  tradingFeeBps: number;
+  mode: string;
   capital: bigint;
   position: bigint;
+}
+
+interface VammConfig {
+  mode: string;
+  tradingFeeBps: number;
+  baseSpreadBps: number;
+  maxTotalBps: number;
+  impactKBps: number;
 }
 
 function computePassiveQuote(oraclePrice: bigint, edgeBps: bigint): { bid: bigint; ask: bigint } {
@@ -35,10 +50,46 @@ async function getChainlinkPrice(connection: any, oracle: PublicKey): Promise<{ 
   return { price: answer, decimals };
 }
 
+/**
+ * Read vAMM context from matcher context account.
+ * Context data starts at offset 64 (first 64 bytes are matcher return).
+ * Returns null if no vAMM magic found (legacy 50bps passive).
+ */
+async function readVammContext(connection: Connection, ctxPubkey: PublicKey): Promise<VammConfig | null> {
+  try {
+    const info = await connection.getAccountInfo(ctxPubkey);
+    if (!info || info.data.length < 320) return null;
+
+    // vAMM context starts at offset 64
+    const vammData = info.data.subarray(64);
+    const magic = vammData.readBigUInt64LE(0);
+
+    // Check for vAMM magic "PERCMATC" in LE
+    const PERCMATC_LE = BigInt("0x504552434d415443");
+    if (magic !== PERCMATC_LE) return null;
+
+    const mode = vammData.readUInt8(12);
+    const tradingFeeBps = vammData.readUInt32LE(16);
+    const baseSpreadBps = vammData.readUInt32LE(20);
+    const maxTotalBps = vammData.readUInt32LE(24);
+    const impactKBps = vammData.readUInt32LE(28);
+
+    return {
+      mode: mode === 0 ? "passive" : "vamm",
+      tradingFeeBps,
+      baseSpreadBps,
+      maxTotalBps,
+      impactKBps,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function registerBestPrice(program: Command): void {
   program
     .command("best-price")
-    .description("Scan LPs and find best prices for trading")
+    .description("Scan LPs and find best prices for trading (reads actual matcher context)")
     .requiredOption("--slab <pubkey>", "Slab account public key")
     .requiredOption("--oracle <pubkey>", "Price oracle account")
     .action(async (opts, cmd) => {
@@ -71,16 +122,33 @@ export function registerBestPrice(program: Command): void {
           (account.matcherProgram && !account.matcherProgram.equals(PublicKey.default));
 
         if (isLp) {
-          // For now, assume all matchers are 50bps passive
-          const edgeBps = 50;
-          const { bid, ask } = computePassiveQuote(oraclePrice, BigInt(edgeBps));
+          // Try to read actual vAMM context from matcher context account
+          let edgeBps = 50; // default legacy
+          let tradingFeeBps = 0;
+          let mode = "legacy-passive";
+          
+          if (account.matcherContext && !account.matcherContext.equals(PublicKey.default)) {
+            const vammCfg = await readVammContext(ctx.connection, account.matcherContext);
+            if (vammCfg) {
+              edgeBps = vammCfg.baseSpreadBps;
+              tradingFeeBps = vammCfg.tradingFeeBps;
+              mode = vammCfg.mode;
+            }
+          }
+
+          // Total effective spread = base spread + trading fee
+          const totalEdgeBps = edgeBps + tradingFeeBps;
+          const { bid, ask } = computePassiveQuote(oraclePrice, BigInt(totalEdgeBps));
 
           quotes.push({
             lpIndex: idx,
             matcherProgram: account.matcherProgram?.toBase58() || "none",
+            matcherContext: account.matcherContext?.toBase58() || "none",
             bid,
             ask,
-            edgeBps,
+            edgeBps: totalEdgeBps,
+            tradingFeeBps,
+            mode,
             capital: account.capital,
             position: account.positionSize,
           });
@@ -111,9 +179,12 @@ export function registerBestPrice(program: Command): void {
           lps: quotes.map(q => ({
             index: q.lpIndex,
             matcherProgram: q.matcherProgram,
+            matcherContext: q.matcherContext,
+            mode: q.mode,
             bid: q.bid.toString(),
             ask: q.ask.toString(),
             edgeBps: q.edgeBps,
+            tradingFeeBps: q.tradingFeeBps,
             capital: q.capital.toString(),
             position: q.position.toString(),
           })),
@@ -139,7 +210,7 @@ export function registerBestPrice(program: Command): void {
           const bidUsd = Number(q.bid) / Math.pow(10, oracleData.decimals);
           const askUsd = Number(q.ask) / Math.pow(10, oracleData.decimals);
           const capitalSol = Number(q.capital) / 1e9;
-          console.log(`LP ${q.lpIndex} (${q.edgeBps}bps): bid=$${bidUsd.toFixed(4)} ask=$${askUsd.toFixed(4)} capital=${capitalSol.toFixed(2)}SOL pos=${q.position}`);
+          console.log(`LP ${q.lpIndex} [${q.mode}] (${q.edgeBps}bps = ${q.edgeBps - q.tradingFeeBps}spread+${q.tradingFeeBps}fee): bid=$${bidUsd.toFixed(4)} ask=$${askUsd.toFixed(4)} capital=${capitalSol.toFixed(2)}SOL pos=${q.position}`);
         }
 
         console.log("\n--- Best Prices ---");
